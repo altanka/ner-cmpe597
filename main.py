@@ -52,10 +52,12 @@ Let's see a quick example.
 
 # Author: Robert Guthrie
 
+from unicodedata import bidirectional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from sklearn.model_selection import train_test_split
 
 from parser import get_dataset
 
@@ -98,7 +100,7 @@ print(hidden)
 # not use Viterbi or Forward-Backward or anything like that, but as a
 # (challenging) exercise to the reader, think about how Viterbi could be
 # used after you have seen what is going on. In this example, we also refer
-# to embeddings. If you are unfamiliar with embeddings, you can read up 
+# to embeddings. If you are unfamiliar with embeddings, you can read up
 # about them `here <https://pytorch.org/tutorials/beginner/nlp/word_embeddings_tutorial.html>`__.
 #
 # The model is as follows: let our input sentence be
@@ -132,19 +134,31 @@ def prepare_sequence(seq, to_ix):
 
 # training_data = [
 #     # Tags are: DET - determiner; NN - noun; V - verb
-#     # For example, the word "The" is a determiner 
+#     # For example, the word "The" is a determiner
 #     ("The dog ate the apple".split(), ["DET", "NN", "V", "DET", "NN"]),
 #     ("Everybody read that book".split(), ["NN", "V", "DET", "NN"])
 # ]
-training_data = get_dataset()
+all_data = get_dataset()
+X = []
+y = []
+for (val, label) in all_data:
+    X.append(val)
+    y.append(label)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.33, random_state=42)
+training_data = []
+for (index, label) in enumerate(y_train):
+    training_data.append((X_train[index], label))
 word_to_ix = {}
 # For each words-list (sentence) and tags-list in each tuple of training_data
-for sent, tags in training_data:
+for sent, tags in all_data:
     for word in sent:
         if word not in word_to_ix:  # word has not been assigned an index yet
-            word_to_ix[word] = len(word_to_ix)  # Assign each word with a unique index
+            # Assign each word with a unique index
+            word_to_ix[word] = len(word_to_ix)
 print(word_to_ix)
-tag_to_ix = {"PERSONB": 0, "PERSONI": 1, "LOCATIONB": 2, "LOCATIONI": 3, "ORGANIZATIONB": 4, "ORGANIZATIONI": 5, "O": 6}  # Assign each tag with a unique index
+tag_to_ix = {"PERSONB": 0, "PERSONI": 1, "LOCATIONB": 2, "LOCATIONI": 3,
+             "ORGANIZATIONB": 4, "ORGANIZATIONI": 5, "O": 6}  # Assign each tag with a unique index
 
 # These will usually be more like 32 or 64 dimensional.
 # We will keep them small, so we can see how the weights change as we train.
@@ -165,10 +179,10 @@ class LSTMTagger(nn.Module):
 
         # The LSTM takes word embeddings as inputs, and outputs hidden states
         # with dimensionality hidden_dim.
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, bidirectional=True)
 
         # The linear layer that maps from hidden state space to tag space
-        self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
+        self.hidden2tag = nn.Linear(hidden_dim * 2, tagset_size)
 
     def forward(self, sentence):
         embeds = self.word_embeddings(sentence)
@@ -193,7 +207,8 @@ with torch.no_grad():
     tag_scores = model(inputs)
     print(tag_scores)
 
-for epoch in range(300):  # again, normally you would NOT do 300 epochs, it is toy data
+for epoch in range(100):  # again, normally you would NOT do 300 epochs, it is toy data
+    print("Epoch: %d" % (epoch + 1))
     for sentence, tags in training_data:
         # Step 1. Remember that Pytorch accumulates gradients.
         # We need to clear them out before each instance
@@ -215,8 +230,8 @@ for epoch in range(300):  # again, normally you would NOT do 300 epochs, it is t
 
 # See what the scores are after training
 with torch.no_grad():
-    inputs = prepare_sequence(training_data[0][0], word_to_ix)
-    tag_scores = model(inputs)
+    # inputs = prepare_sequence(training_data[0][0], word_to_ix)
+    # tag_scores = model(inputs)
 
     # The sentence is "the dog ate the apple".  i,j corresponds to score for tag j
     # for word i. The predicted tag is the maximum scoring tag.
@@ -224,33 +239,29 @@ with torch.no_grad():
     # since 0 is index of the maximum value of row 1,
     # 1 is the index of maximum value of row 2, etc.
     # Which is DET NOUN VERB DET NOUN, the correct sequence!
-    print(tag_scores)
+    # line = training_data[0][0]
+    # sentence_tag_list = []
+    # for (index, score) in enumerate(tag_scores):
+    #     max_val = max(score)
+    #     max_ind = list(score).index(max_val)
+    #     tag = (list(tag_to_ix.keys())[max_ind])
+    #     print(line[index], tag)
+    # print(tag_scores)
 
+    total_accuracy = 0
+    for (index, value) in enumerate(X_test):
+        inputs = prepare_sequence(value, word_to_ix)
+        correct_tags = y_test[index]
+        tag_scores = model(inputs)
+        predicted_tags = []
+        for (index, score) in enumerate(tag_scores):
+            max_val = max(score)
+            max_ind = list(score).index(max_val)
+            predicted_tags.append(max_ind)
+        diff_count = sum(map(lambda x, y: bool(
+            x-tag_to_ix[y]), predicted_tags, correct_tags))
+        accuracy = 1 - diff_count / len(predicted_tags)
+        total_accuracy += accuracy
 
-######################################################################
-# Exercise: Augmenting the LSTM part-of-speech tagger with character-level features
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#
-# In the example above, each word had an embedding, which served as the
-# inputs to our sequence model. Let's augment the word embeddings with a
-# representation derived from the characters of the word. We expect that
-# this should help significantly, since character-level information like
-# affixes have a large bearing on part-of-speech. For example, words with
-# the affix *-ly* are almost always tagged as adverbs in English.
-#
-# To do this, let :math:`c_w` be the character-level representation of
-# word :math:`w`. Let :math:`x_w` be the word embedding as before. Then
-# the input to our sequence model is the concatenation of :math:`x_w` and
-# :math:`c_w`. So if :math:`x_w` has dimension 5, and :math:`c_w`
-# dimension 3, then our LSTM should accept an input of dimension 8.
-#
-# To get the character level representation, do an LSTM over the
-# characters of a word, and let :math:`c_w` be the final hidden state of
-# this LSTM. Hints:
-#
-# * There are going to be two LSTM's in your new model.
-#   The original one that outputs POS tag scores, and the new one that
-#   outputs a character-level representation of each word.
-# * To do a sequence model over characters, you will have to embed characters.
-#   The character embeddings will be the input to the character LSTM.
-#
+    final_accuracy = total_accuracy / len(X_test)
+    print('Accuracy: %f' % final_accuracy)
