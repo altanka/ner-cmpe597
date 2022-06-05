@@ -1,80 +1,32 @@
 # -*- coding: utf-8 -*-
-r"""
-Sequence Models and Long Short-Term Memory Networks
-===================================================
 
-At this point, we have seen various feed-forward networks. That is,
-there is no state maintained by the network at all. This might not be
-the behavior we want. Sequence models are central to NLP: they are
-models where there is some sort of dependence through time between your
-inputs. The classical example of a sequence model is the Hidden Markov
-Model for part-of-speech tagging. Another example is the conditional
-random field.
-
-A recurrent neural network is a network that maintains some kind of
-state. For example, its output could be used as part of the next input,
-so that information can propagate along as the network passes over the
-sequence. In the case of an LSTM, for each element in the sequence,
-there is a corresponding *hidden state* :math:`h_t`, which in principle
-can contain information from arbitrary points earlier in the sequence.
-We can use the hidden state to predict words in a language model,
-part-of-speech tags, and a myriad of other things.
-
-
-LSTMs in Pytorch
-~~~~~~~~~~~~~~~~~
-
-Before getting to the example, note a few things. Pytorch's LSTM expects
-all of its inputs to be 3D tensors. The semantics of the axes of these
-tensors is important. The first axis is the sequence itself, the second
-indexes instances in the mini-batch, and the third indexes elements of
-the input. We haven't discussed mini-batching, so let's just ignore that
-and assume we will always have just 1 dimension on the second axis. If
-we want to run the sequence model over the sentence "The cow jumped",
-our input should look like
-
-.. math::
-
-
-   \begin{bmatrix}
-   \overbrace{q_\text{The}}^\text{row vector} \\
-   q_\text{cow} \\
-   q_\text{jumped}
-   \end{bmatrix}
-
-Except remember there is an additional 2nd dimension with size 1.
-
-In addition, you could go through the sequence one at a time, in which
-case the 1st axis will have size 1 also.
-
-Let's see a quick example.
-"""
-
-# Author: Robert Guthrie
-
-from unicodedata import bidirectional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
+import lstm_encoder_decoder
+import numpy as np
+import torch.nn.functional as F
 
 from parser import get_dataset
+
+from vae import Dataset, VariationalAutoencoder, vae_train
 
 torch.manual_seed(1)
 
 ######################################################################
 
-lstm = nn.LSTM(3, 3)  # Input dim is 3, output dim is 3
-inputs = [torch.randn(1, 3) for _ in range(5)]  # make a sequence of length 5
+# lstm = nn.LSTM(3, 3)  # Input dim is 3, output dim is 3
+# inputs = [torch.randn(1, 3) for _ in range(5)]  # make a sequence of length 5
 
-# initialize the hidden state.
-hidden = (torch.randn(1, 1, 3),
-          torch.randn(1, 1, 3))
-for i in inputs:
-    # Step through the sequence one element at a time.
-    # after each step, hidden contains the hidden state.
-    out, hidden = lstm(i.view(1, 1, -1), hidden)
+# # initialize the hidden state.
+# hidden = (torch.randn(1, 1, 3),
+#           torch.randn(1, 1, 3))
+# for i in inputs:
+#     # Step through the sequence one element at a time.
+#     # after each step, hidden contains the hidden state.
+#     out, hidden = lstm(i.view(1, 1, -1), hidden)
 
 # alternatively, we can do the entire sequence all at once.
 # the first value returned by LSTM is all of the hidden states throughout
@@ -85,11 +37,11 @@ for i in inputs:
 # "hidden" will allow you to continue the sequence and backpropagate,
 # by passing it as an argument  to the lstm at a later time
 # Add the extra 2nd dimension
-inputs = torch.cat(inputs).view(len(inputs), 1, -1)
-hidden = (torch.randn(1, 1, 3), torch.randn(1, 1, 3))  # clean out hidden state
-out, hidden = lstm(inputs, hidden)
-print(out)
-print(hidden)
+# inputs = torch.cat(inputs).view(len(inputs), 1, -1)
+# hidden = (torch.randn(1, 1, 3), torch.randn(1, 1, 3))  # clean out hidden state
+# out, hidden = lstm(inputs, hidden)
+# print(out)
+# print(hidden)
 
 
 ######################################################################
@@ -162,13 +114,64 @@ tag_to_ix = {"PERSONB": 0, "PERSONI": 1, "LOCATIONB": 2, "LOCATIONI": 3,
 
 # These will usually be more like 32 or 64 dimensional.
 # We will keep them small, so we can see how the weights change as we train.
-EMBEDDING_DIM = 6
-HIDDEN_DIM = 6
+EMBEDDING_DIM = 100
+HIDDEN_DIM = 128
 
 ######################################################################
 # Create the model:
 
 
+def windowed_dataset(y, input_window = 5, output_window = 1, stride = 1, num_features = 1):
+  
+    '''
+    create a windowed dataset
+    
+    : param y:                time series feature (array)
+    : param input_window:     number of y samples to give model 
+    : param output_window:    number of future y samples to predict  
+    : param stide:            spacing between windows   
+    : param num_features:     number of features (i.e., 1 for us, but we could have multiple features)
+    : return X, Y:            arrays with correct dimensions for LSTM
+    :                         (i.e., [input/output window size # examples, # features])
+    '''
+  
+    L = y.shape[0]
+    num_samples = (L - input_window - output_window) // stride + 1
+
+    X = np.zeros([input_window, num_samples, num_features])
+    Y = np.zeros([output_window, num_samples, num_features])    
+    
+    for ff in np.arange(num_features):
+        for ii in np.arange(num_samples):
+            start_x = stride * ii
+            end_x = start_x + input_window
+            X[:, ii, ff] = y[start_x:end_x, ff]
+
+            start_y = stride * ii + input_window
+            end_y = start_y + output_window 
+            Y[:, ii, ff] = y[start_y:end_y, ff]
+
+    return X, Y
+
+def numpy_to_torch(Xtrain, Ytrain, Xtest, Ytest):
+    '''
+    convert numpy array to PyTorch tensor
+    
+    : param Xtrain:                           windowed training input data (input window size, # examples, # features); np.array
+    : param Ytrain:                           windowed training target data (output window size, # examples, # features); np.array
+    : param Xtest:                            windowed test input data (input window size, # examples, # features); np.array
+    : param Ytest:                            windowed test target data (output window size, # examples, # features); np.array
+    : return X_train_torch, Y_train_torch,
+    :        X_test_torch, Y_test_torch:      all input np.arrays converted to PyTorch tensors 
+    '''
+    
+    X_train_torch = torch.from_numpy(Xtrain).type(torch.Tensor)
+    Y_train_torch = torch.from_numpy(Ytrain).type(torch.Tensor)
+
+    X_test_torch = torch.from_numpy(Xtest).type(torch.Tensor)
+    Y_test_torch = torch.from_numpy(Ytest).type(torch.Tensor)
+    
+    return X_train_torch, Y_train_torch, X_test_torch, Y_test_torch
 class LSTMTagger(nn.Module):
 
     def __init__(self, embedding_dim, hidden_dim, vocab_size, tagset_size):
@@ -193,12 +196,38 @@ class LSTMTagger(nn.Module):
 
 ######################################################################
 # Train the model:
+# x_tensors = []
+# y_tensors = []
+# for sentence, tags in training_data:
+#     idxs_word = [word_to_ix[w] for w in sentence]
+#     idxs_tag = [tag_to_ix[w] for w in tags]
+#     x_tensors.extend(np.asarray(idxs_word, dtype=np.int32))
+#     y_tensors.extend(np.asarray(idxs_tag, dtype=np.int32))
 
+# x_tensors = np.asarray(x_tensors, dtype=np.int32)
+# y_tensors = np.asarray(y_tensors, dtype=np.int32)
+
+# iw = 80 
+# ow = 20 
+# s = 5
+# x_tensors, y_tensors = windowed_dataset(y_tensors, input_window = iw, output_window = ow, stride = s)
+
+# x_tensors = torch.from_numpy(x_tensors).type(torch.Tensor)
+# y_tensors = torch.from_numpy(y_tensors).type(torch.Tensor)
+# train_data = torch.hstack((x_tensors, y_tensors))
+# train_loader = torch.utils.data.DataLoader(train_data, batch_size= 784, shuffle=True)
+# vae = VariationalAutoencoder(2) # GPU
+# vae = vae_train(vae, train_loader)
+
+# model = lstm_encoder_decoder.lstm_seq2seq(
+#     input_size=x_tensors.shape[0], hidden_size=15)
+# loss = model.train_model(x_tensors, y_tensors, n_epochs=50, target_len=len(tag_to_ix), batch_size=5,
+#                          training_prediction='mixed_teacher_forcing', teacher_forcing_ratio=0.6, learning_rate=0.01, dynamic_tf=False)
 
 model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix))
 loss_function = nn.NLLLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.1)
-
+print(model)
 # See what the scores are before training
 # Note that element i,j of the output is the score for tag j for word i.
 # Here we don't need to train, so the code is wrapped in torch.no_grad()
@@ -207,7 +236,7 @@ with torch.no_grad():
     tag_scores = model(inputs)
     print(tag_scores)
 
-for epoch in range(100):  # again, normally you would NOT do 300 epochs, it is toy data
+for epoch in range(20):  # again, normally you would NOT do 300 epochs, it is toy data
     print("Epoch: %d" % (epoch + 1))
     for sentence, tags in training_data:
         # Step 1. Remember that Pytorch accumulates gradients.
@@ -247,7 +276,18 @@ with torch.no_grad():
     #     tag = (list(tag_to_ix.keys())[max_ind])
     #     print(line[index], tag)
     # print(tag_scores)
+    out = """<style type="text/css" media="screen">
+        table {
+            border-collapse: collapse;
+            border: 1px solid black;
+            font-size: 12px;
+        }
 
+        table td {
+            border: 1px solid black;
+        }
+        </style>"""
+    out += '<table>' + '<tbody>'
     total_accuracy = 0
     for (index, value) in enumerate(X_test):
         inputs = prepare_sequence(value, word_to_ix)
@@ -262,6 +302,28 @@ with torch.no_grad():
             x-tag_to_ix[y]), predicted_tags, correct_tags))
         accuracy = 1 - diff_count / len(predicted_tags)
         total_accuracy += accuracy
-
+        words_line = ''
+        correct_line = ''
+        predicted_line = ''
+        for (word_ind, word) in enumerate(value):
+            words_line += '<td>' + word + '</td>'
+            correct_line += '<td>' + correct_tags[word_ind] + '</td>'
+            predicted_line += '<td>' + \
+                (list(tag_to_ix.keys())[predicted_tags[word_ind]]) + '</td>'
+        out += '<tr>'
+        out += words_line
+        out += '</tr>'
+        out += '<tr>'
+        out += correct_line
+        out += '</tr>'
+        out += '<tr>'
+        out += predicted_line
+        out += '</tr>'
     final_accuracy = total_accuracy / len(X_test)
+    out += '</tbody></table>'
     print('Accuracy: %f' % final_accuracy)
+    with open('output.html', 'w') as f:
+        f.write(out)
+
+
+
